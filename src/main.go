@@ -234,7 +234,6 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 	} else if useFilenameDate {
 		if guessed := guessMetadataFromFilename(base); guessed != nil {
 			meta = guessed
-			repaired = true
 			metaSource = "filename"
 		}
 	}
@@ -247,29 +246,37 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 			meta = &Metadata{
 				PhotoTakenTime: Timestamp{
 					Timestamp: fmt.Sprintf("%d", t.Unix()),
-					Formatted: t.Format("Jan 2, 2006, 3:04:05 PM MST"),
+					Formatted: t.Format("2006:01:02 15:04:05"),
 				},
 				CreationTime: Timestamp{
 					Timestamp: fmt.Sprintf("%d", t.Unix()),
 					Formatted: t.Format("Jan 2, 2006, 3:04:05 PM MST"),
 				},
 			}
-			repaired = true
 		}
 	}
 
+	if !dryRun {
+		err = copyFile(filePath, outPath)
+	}
+
 	if meta != nil && !dryRun {
-		applyExif(filePath, meta)
-		applyFileTimestamp(filePath, meta.PhotoTakenTime.Timestamp)
+		err = applyExif(outPath, meta)
+		if err != nil {
+			log.Printf("Failed to apply EXIF metadata for %s: %v", outPath, err)
+			repaired = false
+		}
+		err = applyFileTimestamp(outPath, meta.PhotoTakenTime.Timestamp)
+		if err != nil {
+			log.Printf("Failed to apply file timestamp for %s: %v", outPath, err)
+			repaired = false
+		}
 	}
 
 	metaTrackingMutex.Lock()
 	metaTracking[base] = metaSource
 	metaTrackingMutex.Unlock()
 
-	if !dryRun {
-		err = copyFile(filePath, outPath)
-	}
 	return base, repaired, err
 }
 
@@ -283,9 +290,9 @@ func parseMetadata(path string) (*Metadata, error) {
 	return &meta, err
 }
 
-func applyExif(path string, meta *Metadata) {
+func applyExif(path string, meta *Metadata) error {
 	if meta.PhotoTakenTime.Formatted == "" && meta.CreationTime.Formatted == "" && meta.GeoData.Latitude == 0 && meta.GeoData.Longitude == 0 {
-		return // nothing to apply
+		return fmt.Errorf("no metadata supplied for %s", path)
 	}
 
 	// reuse shared exifTool instance
@@ -295,15 +302,29 @@ func applyExif(path string, meta *Metadata) {
 	}
 	for idx, m := range metadatas {
 		if m.Err != nil {
-			log.Printf("Resetting metadata due to error reading for %s: %v", path, metadatas[0].Err)
+			log.Printf("Resetting metadata due to error reading for %s: %v", path, m.Err)
 			metadatas[idx] = exiftool.EmptyFileMetadata()
 		}
 	}
-	if meta.PhotoTakenTime.Formatted != "" {
-		metadatas[0].SetString("DateTimeOriginal", meta.PhotoTakenTime.Formatted)
+	if meta.PhotoTakenTime.Timestamp != "" {
+		tsInt, err := strconv.ParseInt(meta.PhotoTakenTime.Timestamp, 10, 64)
+		if err == nil {
+			parsed := time.Unix(tsInt, 0)
+			formatted := parsed.Format("2006:01:02 15:04:05")
+			metadatas[0].SetString("DateTimeOriginal", formatted)
+		} else {
+			log.Printf("Invalid PhotoTakenTime timestamp for %s: %v", path, err)
+		}
 	}
-	if meta.CreationTime.Formatted != "" {
-		metadatas[0].SetString("CreateDate", meta.CreationTime.Formatted)
+	if meta.CreationTime.Timestamp != "" {
+		tsInt, err := strconv.ParseInt(meta.CreationTime.Timestamp, 10, 64)
+		if err == nil {
+			parsed := time.Unix(tsInt, 0)
+			formatted := parsed.Format("2006:01:02 15:04:05")
+			metadatas[0].SetString("CreateDate", formatted)
+		} else {
+			log.Printf("Invalid CreationTime timestamp for %s: %v", path, err)
+		}
 	}
 	if meta.GeoData.Latitude != 0 {
 		metadatas[0].SetFloat("GPSLatitude", meta.GeoData.Latitude)
@@ -321,7 +342,7 @@ func applyExif(path string, meta *Metadata) {
 	}
 	if !safeApply {
 		log.Printf("Skipping EXIF write for %s due to previous errors", path)
-		return
+		return fmt.Errorf("metadata contains errors, skipping write")
 	}
 	if !dryRun {
 		exifTool.WriteMetadata(metadatas)
@@ -330,19 +351,26 @@ func applyExif(path string, meta *Metadata) {
 	}
 	for _, m := range metadatas {
 		if m.Err != nil {
-			log.Printf("Error writing metadata for %s: %v", path, m.Err)
+			return fmt.Errorf("error writing metadata for %s: %v", path, m.Err)
 		}
 	}
+	return nil
 }
 
-func applyFileTimestamp(path, unixTimestamp string) {
+func applyFileTimestamp(path, unixTimestamp string) error {
 	tsInt, err := strconv.ParseInt(unixTimestamp, 10, 64)
 	if err != nil {
-		log.Printf("invalid timestamp for %s: %v", path, err)
-		return
+		return fmt.Errorf("invalid timestamp for %s: %v", path, err)
 	}
 	t := time.Unix(tsInt, 0)
-	os.Chtimes(path, t, t)
+	if t.IsZero() {
+		return fmt.Errorf("zero timestamp for %s", path)
+	}
+	err = os.Chtimes(path, t, t)
+	if err != nil {
+		return fmt.Errorf("failed to change file times for %s: %v", path, err)
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -393,7 +421,7 @@ func guessMetadataFromFilename(filename string) *Metadata {
 			substr := name[len(name)-len(pat):]
 			if t, err := time.Parse(pat, substr); err == nil {
 				ts := fmt.Sprintf("%d", t.Unix())
-				formatted := t.Format("Jan 2, 2006, 3:04:05 PM MST")
+				formatted := t.Format("2006:01:02 15:04:05")
 				return &Metadata{
 					PhotoTakenTime: Timestamp{Timestamp: ts, Formatted: formatted},
 					CreationTime:   Timestamp{Timestamp: ts, Formatted: formatted},
