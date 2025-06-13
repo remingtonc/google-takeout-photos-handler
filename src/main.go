@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -40,6 +41,9 @@ type Metadata struct {
 
 var (
 	dryRun                bool
+	useChecksum           bool
+	detectDuplicates      bool
+	skipDuplicates        bool
 	inputDir              string
 	outputDir             string
 	maxDirWorkers         int
@@ -49,6 +53,10 @@ var (
 
 	metaTracking      = make(map[string]string)
 	metaTrackingMutex sync.Mutex
+
+	fileIndex      []IndexedFile
+	duplicateIndex = make(map[string][]IndexedFile)
+	skippedPaths   = make(map[string]bool)
 )
 
 var (
@@ -57,6 +65,7 @@ var (
 )
 
 func init() {
+
 	flag.StringVar(&inputDir, "input", "./Takeout/Google Photos", "Input Google Photos directory")
 	flag.StringVar(&outputDir, "output", "./output/photos-flat", "Flat output directory for media")
 	flag.IntVar(&maxDirWorkers, "max-dir-workers", 4, "Max number of directory workers")
@@ -64,12 +73,28 @@ func init() {
 	flag.BoolVar(&useFilenameDate, "use-filename-date", true, "Use timestamps from filenames if no supplemental metadata is present")
 	flag.BoolVar(&useAlbumYear, "use-album-year", true, "Use album year (from folder name) if no other metadata is available")
 	flag.BoolVar(&dryRun, "dry-run", false, "Perform a dry run without writing files")
+	flag.BoolVar(&useChecksum, "use-checksum", false, "Use checksums when comparing duplicate files")
+	flag.BoolVar(&detectDuplicates, "detect-duplicates", true, "Detect and group duplicate files")
+	flag.BoolVar(&skipDuplicates, "skip-duplicates", false, "Skip processing files detected as duplicates")
 	flag.Parse()
 }
 
 var exifTool *exiftool.Exiftool
 
+type IndexedFile struct {
+	Path       string
+	FileName   string
+	Album      string
+	Size       int64
+	Checksum   string
+	Timestamp  string
+	MetaSource string
+}
+
 func main() {
+	if detectDuplicates {
+		scanAllFiles()
+	}
 	dirs, err := os.ReadDir(inputDir)
 	if err != nil {
 		log.Fatalf("Input directory cannot be read: %v", err)
@@ -127,6 +152,34 @@ func progressLogger(done <-chan struct{}) {
 		case <-done:
 			return
 		}
+	}
+}
+
+func writeDuplicateReport() {
+	if len(duplicateIndex) == 0 {
+		return
+	}
+	report := make(map[string][]string)
+	for key, files := range duplicateIndex {
+		if len(files) > 1 {
+			paths := make([]string, 0, len(files))
+			for _, f := range files {
+				paths = append(paths, f.Path)
+			}
+			report[key] = paths
+		}
+	}
+	if len(report) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal duplicate report: %v", err)
+		return
+	}
+	err = os.WriteFile(filepath.Join(outputDir, "duplicates.json"), data, 0644)
+	if err != nil {
+		log.Printf("failed to write duplicate report: %v", err)
 	}
 }
 
@@ -216,6 +269,12 @@ func processAlbumDir(albumPath string) {
 }
 
 func processFile(filePath, metadataPath string) (string, bool, error) {
+	if skipDuplicates {
+		if skippedPaths[filePath] {
+			log.Printf("Skipping duplicate file: %s", filePath)
+			return filepath.Base(filePath), false, nil
+		}
+	}
 	base := filepath.Base(filePath)
 	outPath := filepath.Join(outputDir, base)
 
@@ -225,7 +284,7 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 	var err error
 
 	if metadataPath != "" {
-		meta, err = parseMetadata(metadataPath)
+		meta, err = findSupplementalMetadata(filePath)
 		if err != nil {
 			return "", false, err
 		}
@@ -278,6 +337,40 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 	metaTrackingMutex.Unlock()
 
 	return base, repaired, err
+}
+
+func findSupplementalMetadata(filePath string) (*Metadata, error) {
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	bestMatch := ""
+	maxMatchLen := 0
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		metaBase := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
+		if strings.HasPrefix(metaBase, name) {
+			if len(name) > maxMatchLen {
+				bestMatch = filepath.Join(dir, f.Name())
+				maxMatchLen = len(name)
+			}
+		} else if strings.Contains(name, metaBase) || strings.Contains(metaBase, name) {
+			if len(metaBase) > maxMatchLen {
+				bestMatch = filepath.Join(dir, f.Name())
+				maxMatchLen = len(metaBase)
+			}
+		}
+	}
+	if bestMatch == "" {
+		return nil, fmt.Errorf("no matching metadata for %s", base)
+	}
+	return parseMetadata(bestMatch)
 }
 
 func parseMetadata(path string) (*Metadata, error) {
@@ -445,7 +538,87 @@ func extractYearFromPath(path string) int {
 	return 0
 }
 
+func scanAllFiles() {
+	log.Println("Scanning all files for duplicate detection...")
+	err := filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		album := extractAlbumFromPath(path)
+		size := info.Size()
+		timestamp := ""
+		metaSource := ""
+		if meta, err := findSupplementalMetadata(path); err == nil {
+			timestamp = meta.PhotoTakenTime.Timestamp
+			metaSource = "supplemental"
+		} else if useFilenameDate {
+			if guessed := guessMetadataFromFilename(filepath.Base(path)); guessed != nil {
+				timestamp = guessed.PhotoTakenTime.Timestamp
+				metaSource = "filename"
+			}
+		} else if useAlbumYear {
+			albumYear := extractYearFromPath(path)
+			if albumYear != 0 {
+				t := time.Date(albumYear, 1, 1, 0, 0, 0, 0, time.UTC)
+				timestamp = fmt.Sprintf("%d", t.Unix())
+				metaSource = "album-year"
+			}
+		}
+		checksum := ""
+		if useChecksum {
+			if f, err := os.Open(path); err == nil {
+				h := sha1.New()
+				if _, err := io.Copy(h, f); err == nil {
+					checksum = fmt.Sprintf("%x", h.Sum(nil))
+				}
+				f.Close()
+			}
+		}
+		key := fmt.Sprintf("%d|%s", size, checksum)
+		file := IndexedFile{
+			Path: path, FileName: filepath.Base(path), Album: album,
+			Size: size, Checksum: checksum, Timestamp: timestamp, MetaSource: metaSource,
+		}
+		fileIndex = append(fileIndex, file)
+		duplicateIndex[key] = append(duplicateIndex[key], file)
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Error scanning files: %v", err)
+	}
+	log.Printf("Scanned %d files. Identified %d duplicate groups.", len(fileIndex), countDuplicateGroups())
+}
+
+func countDuplicateGroups() int {
+	count := 0
+	for _, files := range duplicateIndex {
+		if len(files) > 1 {
+			count++
+			for _, f := range files {
+				skippedPaths[f.Path] = true
+			}
+		}
+	}
+	return count
+}
+
+func extractAlbumFromPath(path string) string {
+	parts := strings.Split(path, string(os.PathSeparator))
+	for i := len(parts) - 1; i >= 0; i-- {
+		if strings.HasPrefix(parts[i], "Photos from ") {
+			return parts[i]
+		}
+	}
+	return "unknown"
+}
+
 func writeMetadataMap() {
+	if !dryRun {
+		writeDuplicateReport()
+	}
 	if dryRun {
 		return
 	}
@@ -456,5 +629,5 @@ func writeMetadataMap() {
 		log.Printf("failed to marshal metadata map: %v", err)
 		return
 	}
-	os.WriteFile(filepath.Join(outputDir, "metadata_map.json"), out, 0644)
+	err = os.WriteFile(filepath.Join(outputDir, "metadata_map.json"), out, 0644)
 }
