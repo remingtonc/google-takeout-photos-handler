@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -58,6 +59,7 @@ var (
 	duplicateIndex = make(map[string][]IndexedFile)
 	skippedPaths   = make(map[string]bool)
 	symlink        bool
+	dangerFixExif  bool
 )
 
 var (
@@ -78,6 +80,7 @@ func init() {
 	flag.BoolVar(&detectDuplicates, "detect-duplicates", true, "Detect and group duplicate files")
 	flag.BoolVar(&skipDuplicates, "skip-duplicates", false, "Skip processing files detected as duplicates")
 	flag.BoolVar(&symlink, "symlink", false, "Create symlinks instead of copying files")
+	flag.BoolVar(&dangerFixExif, "danger-fix-exif", false, "Attempt to fix EXIF data when corrupted")
 	flag.Parse()
 }
 
@@ -331,7 +334,7 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 	}
 
 	if meta != nil && !dryRun {
-		err = applyExif(outPath, meta)
+		err = applyExif(outPath, meta, false)
 		if err != nil {
 			log.Printf("Failed to apply EXIF metadata for %s: %v", outPath, err)
 			repaired = false
@@ -394,7 +397,7 @@ func parseMetadata(path string) (*Metadata, error) {
 	return &meta, err
 }
 
-func applyExif(path string, meta *Metadata) error {
+func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 	if meta.PhotoTakenTime.Formatted == "" && meta.CreationTime.Formatted == "" && meta.GeoData.Latitude == 0 && meta.GeoData.Longitude == 0 {
 		return fmt.Errorf("no metadata supplied for %s", path)
 	}
@@ -455,6 +458,15 @@ func applyExif(path string, meta *Metadata) error {
 	}
 	for _, m := range metadatas {
 		if m.Err != nil {
+			if dangerFixExif && !fixAttempted {
+				log.Printf("Blindly attempting to fix EXIF for %s with error: %v", path, m.Err)
+				// https://exiftool.org/faq.html#Q20
+				cmd := exec.Command(fmt.Sprintf("exiftool -all= -tagsfromfile @ -all:all -unsafe -icc_profile %s", path))
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+				return applyExif(path, meta, true)
+			}
 			return fmt.Errorf("error writing metadata for %s: %v", path, m.Err)
 		}
 	}
