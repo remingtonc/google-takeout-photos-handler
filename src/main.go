@@ -57,6 +57,7 @@ var (
 	fileIndex      []IndexedFile
 	duplicateIndex = make(map[string][]IndexedFile)
 	skippedPaths   = make(map[string]bool)
+	symlink        bool
 )
 
 var (
@@ -76,6 +77,7 @@ func init() {
 	flag.BoolVar(&useChecksum, "use-checksum", false, "Use checksums when comparing duplicate files")
 	flag.BoolVar(&detectDuplicates, "detect-duplicates", true, "Detect and group duplicate files")
 	flag.BoolVar(&skipDuplicates, "skip-duplicates", false, "Skip processing files detected as duplicates")
+	flag.BoolVar(&symlink, "symlink", false, "Create symlinks instead of copying files")
 	flag.Parse()
 }
 
@@ -92,6 +94,7 @@ type IndexedFile struct {
 }
 
 func main() {
+	var startTime = time.Now()
 	if detectDuplicates {
 		scanAllFiles()
 	}
@@ -104,8 +107,6 @@ func main() {
 	if os.IsNotExist(err) {
 		log.Fatalf("Output directory does not exist: %v", err)
 	}
-
-	log.Println("Starting processing of albums...")
 
 	if !dryRun {
 		var err error
@@ -121,6 +122,7 @@ func main() {
 	dirChan := make(chan os.DirEntry, len(dirs))
 	var wg sync.WaitGroup
 
+	log.Printf("Processing directories now with %d directory workers and %d file workers", maxDirWorkers, maxFileWorkers)
 	for range maxDirWorkers {
 		wg.Add(1)
 		go func() {
@@ -140,8 +142,18 @@ func main() {
 	wg.Wait()
 	close(done)
 
-	log.Printf("Processing complete. Total files processed: %d, metadata repaired: %d", totalFilesProcessed, totalMetadataRepaired)
-	writeMetadataMap()
+	log.Printf("Processed directories. Total files processed: %d, metadata repaired: %d", totalFilesProcessed, totalMetadataRepaired)
+	log.Printf("Writing metadata...")
+	err = writeMetadataMap()
+	if err != nil {
+		log.Fatalf("Error writing metadata map: %v", err)
+	}
+	err = writeDuplicateReport()
+	if err != nil {
+		log.Fatalf("Error writing duplicate report: %v", err)
+	}
+	log.Printf("Wrote metadata.")
+	log.Printf("Total time: %s", time.Since(startTime))
 }
 
 func progressLogger(done <-chan struct{}) {
@@ -155,9 +167,12 @@ func progressLogger(done <-chan struct{}) {
 	}
 }
 
-func writeDuplicateReport() {
+func writeDuplicateReport() error {
+	if dryRun {
+		return nil
+	}
 	if len(duplicateIndex) == 0 {
-		return
+		return nil
 	}
 	report := make(map[string][]string)
 	for key, files := range duplicateIndex {
@@ -170,17 +185,13 @@ func writeDuplicateReport() {
 		}
 	}
 	if len(report) == 0 {
-		return
+		return nil
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		log.Printf("failed to marshal duplicate report: %v", err)
-		return
+		return fmt.Errorf("failed to marshal duplicate report: %v", err)
 	}
-	err = os.WriteFile(filepath.Join(outputDir, "duplicates.json"), data, 0644)
-	if err != nil {
-		log.Printf("failed to write duplicate report: %v", err)
-	}
+	return os.WriteFile(filepath.Join(outputDir, "duplicates.json"), data, 0644)
 }
 
 func processAlbumDir(albumPath string) {
@@ -467,20 +478,27 @@ func applyFileTimestamp(path, unixTimestamp string) error {
 }
 
 func copyFile(src, dst string) error {
-	sin, err := os.Open(src)
-	if err != nil {
+	if dryRun {
+		return nil
+	}
+	if symlink {
+		return os.Symlink(src, dst)
+	} else {
+		sin, err := os.Open(src)
+		if err != nil {
+			return err
+		}
+		defer sin.Close()
+
+		sout, err := os.Create(dst)
+		if err != nil {
+			return err
+		}
+		defer sout.Close()
+
+		_, err = io.Copy(sout, sin)
 		return err
 	}
-	defer sin.Close()
-
-	sout, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer sout.Close()
-
-	_, err = io.Copy(sout, sin)
-	return err
 }
 
 func writeAlbumJSON(albumPath string, files []string) {
@@ -615,19 +633,15 @@ func extractAlbumFromPath(path string) string {
 	return "unknown"
 }
 
-func writeMetadataMap() {
-	if !dryRun {
-		writeDuplicateReport()
-	}
+func writeMetadataMap() error {
 	if dryRun {
-		return
+		return nil
 	}
 	metaTrackingMutex.Lock()
 	defer metaTrackingMutex.Unlock()
 	out, err := json.MarshalIndent(metaTracking, "", "  ")
 	if err != nil {
-		log.Printf("failed to marshal metadata map: %v", err)
-		return
+		return fmt.Errorf("failed to marshal metadata map: %v", err)
 	}
-	err = os.WriteFile(filepath.Join(outputDir, "metadata_map.json"), out, 0644)
+	return os.WriteFile(filepath.Join(outputDir, "metadata_map.json"), out, 0644)
 }
