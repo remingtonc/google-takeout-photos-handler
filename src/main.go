@@ -461,7 +461,7 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 			if dangerFixExif && !fixAttempted {
 				log.Printf("Blindly attempting to fix EXIF for %s with error: %v", path, m.Err)
 				// https://exiftool.org/faq.html#Q20
-				cmd := exec.Command(fmt.Sprintf("exiftool -all= -tagsfromfile @ -all:all -unsafe -icc_profile %s", path))
+				cmd := exec.Command("exiftool", "-all=", "-tagsfromfile", "@", "-all:all", "-unsafe", "-icc_profile", path)
 				if err := cmd.Run(); err != nil {
 					return err
 				}
@@ -537,6 +537,7 @@ func guessMetadataFromFilename(filename string) *Metadata {
 		"20060102_150405",     // IMG_20200101_123456
 		"2006-01-02-15-04-05", // 2020-01-02-15-04-05
 		"20060102-150405",     // 20200102-150405
+		"20060102",            // WP_20150313_009
 	}
 	name := strings.TrimSuffix(filename, filepath.Ext(filename))
 	for _, pat := range patterns {
