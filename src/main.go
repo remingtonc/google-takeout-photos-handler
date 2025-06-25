@@ -51,6 +51,9 @@ var (
 	maxFileWorkers        int
 	totalFilesProcessed   int64
 	totalMetadataRepaired int64
+	failedFiles           int64
+	exifIntact            int64
+	exifRepaired          int64
 
 	metaTracking      = make(map[string]string)
 	metaTrackingMutex sync.Mutex
@@ -122,7 +125,7 @@ func main() {
 	done := make(chan struct{})
 	go progressLogger(done)
 
-	dirChan := make(chan os.DirEntry, len(dirs))
+	dirChan := make(chan os.DirEntry, maxDirWorkers)
 	var wg sync.WaitGroup
 
 	log.Printf("Processing directories now with %d directory workers and %d file workers\n", maxDirWorkers, maxFileWorkers)
@@ -163,7 +166,18 @@ func progressLogger(done <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(10 * time.Second):
-			log.Printf("Progress: total files processed: %d, metadata repaired: %d\n", atomic.LoadInt64(&totalFilesProcessed), atomic.LoadInt64(&totalMetadataRepaired))
+			log.Printf("Progress: total files processed: %d, metadata repaired: %d, exif repaired: %d, exif intact: %d, failed files: %d\n", atomic.LoadInt64(&totalFilesProcessed), atomic.LoadInt64(&totalMetadataRepaired), atomic.LoadInt64(&exifRepaired), atomic.LoadInt64(&exifIntact), atomic.LoadInt64(&failedFiles))
+		case <-done:
+			return
+		}
+	}
+}
+
+func statusLogger(message string, done <-chan struct{}) {
+	for {
+		select {
+		case <-time.After(10 * time.Second):
+			log.Println(message)
 		case <-done:
 			return
 		}
@@ -197,12 +211,15 @@ func writeDuplicateReport() error {
 	return os.WriteFile(filepath.Join(outputDir, "duplicates.json"), data, 0644)
 }
 
-func processAlbumDir(albumPath string) {
+func processAlbumDir(albumPath string) error {
 	entries, err := os.ReadDir(albumPath)
 	if err != nil {
-		log.Printf("failed to read album %s: %v", albumPath, err)
-		return
+		return fmt.Errorf("failed to read album %s: %v", albumPath, err)
 	}
+
+	albumDoneChan := make(chan struct{})
+	go statusLogger(fmt.Sprintf("Processing album: %s", filepath.Base(albumPath)), albumDoneChan)
+	defer close(albumDoneChan)
 
 	jsonFiles := make([]os.DirEntry, 0)
 	mediaFiles := make([]os.DirEntry, 0)
@@ -253,7 +270,8 @@ func processAlbumDir(albumPath string) {
 				_, err := entry.Info()
 				if err != nil {
 					log.Printf("error reading file info for %s: %v", entry.Name(), err)
-					return
+					atomic.AddInt64(&failedFiles, 1)
+					continue
 				}
 				filePath := filepath.Join(albumPath, entry.Name())
 				metaPath := fileToMetadata[entry.Name()] // from preloaded map
@@ -269,6 +287,7 @@ func processAlbumDir(albumPath string) {
 					}
 				} else {
 					log.Printf("error processing file %s: %v", filePath, err)
+					atomic.AddInt64(&failedFiles, 1)
 				}
 			}
 		}()
@@ -280,6 +299,7 @@ func processAlbumDir(albumPath string) {
 	wg.Wait()
 	log.Printf("Finished album: %s — %d files, %d metadata repaired\n", filepath.Base(albumPath), len(albumFiles), albumMetaRepaired)
 	writeAlbumJSON(albumPath, albumFiles)
+	return nil
 }
 
 func processFile(filePath, metadataPath string) (string, bool, error) {
@@ -413,13 +433,18 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 			metadatas[idx] = exiftool.EmptyFileMetadata()
 		}
 	}
+
+	changed := false
 	if meta.PhotoTakenTime.Timestamp != "" {
 		tsInt, err := strconv.ParseInt(meta.PhotoTakenTime.Timestamp, 10, 64)
 		if err == nil {
 			parsed := time.Unix(tsInt, 0)
 			formatted := parsed.Format("2006:01:02 15:04:05")
-			// TODO: Check before overwriting.
-			metadatas[0].SetString("DateTimeOriginal", formatted)
+			existing, _ := metadatas[0].GetString("DateTimeOriginal")
+			if existing != formatted {
+				metadatas[0].SetString("DateTimeOriginal", formatted)
+				changed = true
+			}
 		} else {
 			log.Printf("Invalid PhotoTakenTime timestamp for %s: %v\n", path, err)
 		}
@@ -429,16 +454,24 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 		if err == nil {
 			parsed := time.Unix(tsInt, 0)
 			formatted := parsed.Format("2006:01:02 15:04:05")
-			metadatas[0].SetString("CreateDate", formatted)
+			existing, _ := metadatas[0].GetString("CreateDate")
+			if existing != formatted {
+				metadatas[0].SetString("CreateDate", formatted)
+				changed = true
+			}
 		} else {
 			log.Printf("Invalid CreationTime timestamp for %s: %v\n", path, err)
 		}
 	}
-	if meta.GeoData.Latitude != 0 {
+	existingGPSLat, _ := metadatas[0].GetFloat("GPSLatitude")
+	if meta.GeoData.Latitude != existingGPSLat {
 		metadatas[0].SetFloat("GPSLatitude", meta.GeoData.Latitude)
+		changed = true
 	}
-	if meta.GeoData.Longitude != 0 {
+	existingGPSLong, _ := metadatas[0].GetFloat("GPSLongitude")
+	if meta.GeoData.Longitude != existingGPSLong {
 		metadatas[0].SetFloat("GPSLongitude", meta.GeoData.Longitude)
+		changed = true
 	}
 
 	safeApply := true
@@ -452,7 +485,7 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 		log.Printf("Skipping EXIF write for %s due to previous errors\n", path)
 		return fmt.Errorf("metadata contains errors, skipping write")
 	}
-	if !dryRun {
+	if !dryRun && changed {
 		exifTool.WriteMetadata(metadatas)
 	} else {
 		log.Printf("Dry run: would write metadata for %s\n", path)
@@ -470,6 +503,11 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 			}
 			return fmt.Errorf("error writing metadata for %s: %v", path, m.Err)
 		}
+	}
+	if changed || fixAttempted {
+		atomic.AddInt64(&exifRepaired, 1)
+	} else {
+		atomic.AddInt64(&exifIntact, 1)
 	}
 	return nil
 }
