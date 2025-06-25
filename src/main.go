@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"flag"
@@ -58,11 +59,13 @@ var (
 	metaTracking      = make(map[string]string)
 	metaTrackingMutex sync.Mutex
 
-	fileIndex      []IndexedFile
-	duplicateIndex = make(map[string][]IndexedFile)
-	skippedPaths   = make(map[string]bool)
-	symlink        bool
-	dangerFixExif  bool
+	fileIndex          []IndexedFile
+	duplicateIndex     = make(map[string][]IndexedFile)
+	skippedPaths       = make(map[string]bool)
+	dangerFixExifPaths []string
+	dangerFixExifMutex sync.Mutex
+	symlink            bool
+	dangerFixExif      bool
 )
 
 var (
@@ -354,7 +357,7 @@ func processFile(filePath, metadataPath string) (string, bool, error) {
 	}
 
 	if meta != nil && !dryRun {
-		err = applyExif(outPath, meta, false)
+		err = applyExif(outPath, meta, 0)
 		if err != nil {
 			log.Printf("Failed to apply EXIF metadata for %s: %v\n", outPath, err)
 			repaired = false
@@ -417,7 +420,10 @@ func parseMetadata(path string) (*Metadata, error) {
 	return &meta, err
 }
 
-func applyExif(path string, meta *Metadata, fixAttempted bool) error {
+func applyExif(path string, meta *Metadata, fixAttemptCount int64) error {
+	if fixAttemptCount > 1 {
+		log.Fatalf("BUGBUGBUG: Exceeded max fix attempts for %s\n", path)
+	}
 	if meta.PhotoTakenTime.Formatted == "" && meta.CreationTime.Formatted == "" && meta.GeoData.Latitude == 0 && meta.GeoData.Longitude == 0 {
 		return fmt.Errorf("no metadata supplied for %s", path)
 	}
@@ -425,7 +431,7 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 	// reuse shared exifTool instance
 	metadatas := exifTool.ExtractMetadata(path)
 	if len(metadatas) > 1 {
-		log.Printf("WARNING: multiple metadata entries found for %s\n", path)
+		log.Fatalf("WARNING: multiple metadata entries found for %s\n", path)
 	}
 	for idx, m := range metadatas {
 		if m.Err != nil {
@@ -485,29 +491,38 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 		log.Printf("Skipping EXIF write for %s due to previous errors\n", path)
 		return fmt.Errorf("metadata contains errors, skipping write")
 	}
-	if !dryRun && changed {
+	if changed && !dryRun {
 		exifTool.WriteMetadata(metadatas)
-	} else {
-		log.Printf("Dry run: would write metadata for %s\n", path)
 	}
-	for _, m := range metadatas {
-		if m.Err != nil {
-			if dangerFixExif && !fixAttempted {
-				log.Printf("Blindly attempting to fix EXIF for %s before error.\n", path)
-				// https://exiftool.org/faq.html#Q20
-				cmd := exec.Command("exiftool", "-all=", "-tagsfromfile", "@", "-all:all", "-unsafe", "-icc_profile", "-overwrite_original", path)
-				if err := cmd.Run(); err != nil {
-					return err
-				}
-				return applyExif(path, meta, true)
+	if !dryRun && metadatas[0].Err != nil {
+		if dangerFixExif && fixAttemptCount == 0 {
+			if err := dangerFixExifApply(path); err != nil {
+				return fmt.Errorf("error attempting exif fix for %s: %v", path, err)
 			}
-			return fmt.Errorf("error writing metadata for %s: %v", path, m.Err)
+			// Retry once after fix attempt
+			return applyExif(path, meta, fixAttemptCount+1)
 		}
+		return fmt.Errorf("error writing metadata for %s: %v", path, metadatas[0].Err)
 	}
-	if changed || fixAttempted {
+	if changed || fixAttemptCount > 0 {
 		atomic.AddInt64(&exifRepaired, 1)
 	} else {
 		atomic.AddInt64(&exifIntact, 1)
+	}
+	return nil
+}
+
+func dangerFixExifApply(path string) error {
+	dangerFixExifMutex.Lock()
+	defer dangerFixExifMutex.Unlock()
+	dangerFixExifPaths = append(dangerFixExifPaths, path)
+	// If this operation is taking 10 seconds to run, likely borked. Trying to troubleshoot hangs...
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(10)*time.Second)
+	defer cancel()
+	// https://exiftool.org/faq.html#Q20
+	cmd := exec.CommandContext(ctx, "exiftool", "-all=", "-tagsfromfile", "@", "-all:all", "-unsafe", "-icc_profile", "-overwrite_original", path)
+	if err := cmd.Run(); err != nil {
+		return err
 	}
 	return nil
 }
