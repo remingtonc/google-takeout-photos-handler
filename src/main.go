@@ -459,7 +459,7 @@ func applyExif(path string, meta *Metadata, fixAttempted bool) error {
 	for _, m := range metadatas {
 		if m.Err != nil {
 			if dangerFixExif && !fixAttempted {
-				log.Printf("Blindly attempting to fix EXIF for %s with error: %v", path, m.Err)
+				log.Printf("Blindly attempting to fix EXIF for %s before error.", path)
 				// https://exiftool.org/faq.html#Q20
 				cmd := exec.Command("exiftool", "-all=", "-tagsfromfile", "@", "-all:all", "-unsafe", "-icc_profile", path)
 				if err := cmd.Run(); err != nil {
@@ -608,7 +608,12 @@ func scanAllFiles() {
 				f.Close()
 			}
 		}
-		key := fmt.Sprintf("%d|%s", size, checksum)
+		var key string
+		if useChecksum {
+			key = checksum
+		} else {
+			key = fmt.Sprintf("%d|%s", size, timestamp)
+		}
 		file := IndexedFile{
 			Path: path, FileName: filepath.Base(path), Album: album,
 			Size: size, Checksum: checksum, Timestamp: timestamp, MetaSource: metaSource,
@@ -628,7 +633,10 @@ func countDuplicateGroups() int {
 	for _, files := range duplicateIndex {
 		if len(files) > 1 {
 			count++
-			for _, f := range files {
+			for idx, f := range files {
+				if idx == 0 {
+					continue // keep the first occurrence
+				}
 				skippedPaths[f.Path] = true
 			}
 		}
